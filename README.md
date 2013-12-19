@@ -18,8 +18,8 @@ vxlan-netmap
 
 
 Packets including vlan id from a internal interface are encapsulated
-with a VNI which is configured by -v option, and transmited to vxlan
-overlay network from a ovler interface. Type of ethernet frames in
+with a VNI which is configured by -v options, and transmited to vxlan
+overlay network from a overlay interface. Type of ethernet frames in
 vxlan overlay network is always ETHERTYPE_VLAN.
 
 
