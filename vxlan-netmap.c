@@ -40,6 +40,7 @@
 #define VLAN_VALIDATE(v) (0 < v && v < 4096)
 #define VNI_VALIDATE(v) (0 < v && v < 0xFFFFFF)
 
+#define POLL_TIMEOUT 1
 
 struct ether_vlan {
 	__u8	ether_dhost[ETH_ALEN];
@@ -131,13 +132,15 @@ struct vxlan {
 	struct in_addr src_addr;
 	struct in_addr gateway_addr;
 	__u8	src_mac[ETH_ALEN];
+
+	struct netmap_ring * txrings[VXLAN_THREAD_MAX];
 };
 
 struct vxlan vxlan;
 
 struct vxlan_netmap_instance {
-	int rx_fd, tx_fd;
-	struct netmap_ring * txring, * rxring;
+	int tx_qnum, rx_qnum;
+	char * tx_ifname, * rx_ifname;
 };
 
 
@@ -291,6 +294,53 @@ wrapsum(u_int32_t sum)
         sum = ~sum & 0xFFFF;
         return (htons(sum));
 }
+
+/* netmap util*/
+
+int
+extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring, int x)
+{
+	int fd;
+	char * mem;
+	struct nmreq nmr;
+	struct netmap_if * nifp;
+
+	/* open netmap for  ring */
+
+	fd = open ("/dev/netmap", O_RDWR);
+	if (fd < 0) {
+		D ("unable to open /dev/netmap");
+		return -1;
+	}
+
+	memset (&nmr, 0, sizeof (nmr));
+	strcpy (nmr.nr_name, ifname);
+	nmr.nr_version = NETMAP_API;
+	nmr.nr_ringid = (q | NETMAP_HW_RING);
+
+	if (ioctl (fd, NIOCREGIF, &nmr) < 0) {
+		D ("unable to register interface %s", ifname);
+		return -1;
+	}
+
+	mem = mmap (NULL, nmr.nr_memsize,
+		      PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mem == MAP_FAILED) {
+		D ("unable to mmap");
+		return -1;
+	}
+
+	nifp = NETMAP_IF (mem, nmr.nr_offset);
+
+	if (x > 0) 
+		*ring = NETMAP_TXRING (nifp, q);
+	else 
+		*ring = NETMAP_RXRING (nifp, q);
+
+	return fd;
+}
+#define extract_netmap_tx_ring(i, q, r) extract_netmap_ring (i, q, r, 1)
+#define extract_netmap_rx_ring(i, q, r) extract_netmap_ring (i, q, r, 0)
 
 
 /****  FDB  *****/
@@ -548,11 +598,12 @@ set_vxlan_header (struct vxlan_pkt * vpkt, __u32 vni)
 	return;
 }
 
+
 /****  forwarding instance  ****/
 
 void
 process_ether_to_vxlan (struct ether_header * eth, size_t len,
-			struct netmap_ring * txring, int tx_fd)
+			struct netmap_ring * txring)
 {
 	u_int cur;
 	struct vxlan_pkt * vpkt;
@@ -565,7 +616,7 @@ process_ether_to_vxlan (struct ether_header * eth, size_t len,
 	struct netmap_slot * slot;
 
 	if (ntohs (eth->ether_type) != ETHERTYPE_VLAN) {
-		D ("packet is not tagged vlan frame, %x",
+		D ("packet is not tagged vlan frame, type 0x%x",
 		   ntohs (eth->ether_type));
 		return;
 	}
@@ -589,13 +640,6 @@ process_ether_to_vxlan (struct ether_header * eth, size_t len,
 	}
 
 	/* xmit encaped packet */
-	
-	if (txring->avail == 0) {
-		while (!NETMAP_TX_RING_EMPTY (txring)) {
-			ioctl (tx_fd, NIOCTXSYNC, NULL);
-			usleep (1);
-		}
-	}
 
 	cur = txring->cur;
 	slot = &txring->slot[cur];
@@ -609,7 +653,7 @@ process_ether_to_vxlan (struct ether_header * eth, size_t len,
 			sizeof (struct vxlanhdr));
 	set_vxlan_header (vpkt, v->vni);
 
-	memcpy (vpkt->body, eth, len);
+	memcpy (vpkt->body, (char *)eth, len);
 	slot->len = len + VXLAN_HEADROOM;
 	cur = NETMAP_RING_NEXT (txring, cur);
 	
@@ -626,6 +670,7 @@ vxlan_netmap_internal_to_overlay (void * param)
 	   vxlan encap to vxlan overlay networks. */
 
 	u_int cur;
+	int fd;
 	struct ether_header * eth;
 	struct vxlan_netmap_instance * vnet;
 	struct netmap_ring * rxring, * txring;
@@ -634,18 +679,26 @@ vxlan_netmap_internal_to_overlay (void * param)
 	struct pollfd x[1];
 
 	vnet = (struct vxlan_netmap_instance *) param;
-	rxring = vnet->rxring;
-	txring = vnet->txring;
+	D ("rx %s q %d, tx %s q %d", vnet->rx_ifname, vnet->rx_qnum, 
+	   vnet->tx_ifname, vnet->tx_qnum);
+
+	rxring = txring = NULL;
+
+	fd = extract_netmap_rx_ring (vnet->rx_ifname, vnet->rx_qnum, &rxring);
+	extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
 
 	pthread_detach (pthread_self ());
 
-	D ("rx ring is %p tx is %p", rxring, txring);
-
-	x[0].fd = vnet->rx_fd;
+	x[0].fd = fd;
 	x[0].events = POLLIN;
 
 	for (;;) {
-		poll (x, 1, 100);
+#ifdef BUSYWAIT
+		ioctl(fd, NIOCRXSYNC, NULL);
+#else
+		if (poll (x, 1, POLL_TIMEOUT) == 0)
+			continue;
+#endif
 		
 		for (; rxring->avail > 0; rxring->avail--) {
 
@@ -654,10 +707,9 @@ vxlan_netmap_internal_to_overlay (void * param)
 			eth = (struct ether_header *) 
 				NETMAP_BUF (rxring, slot->buf_idx);
 
-			process_ether_to_vxlan (eth, slot->len, txring,
-						vnet->tx_fd);
+			process_ether_to_vxlan (eth, slot->len, txring);
 			rxring->cur = NETMAP_RING_NEXT (rxring, cur);
-			ioctl(vnet->tx_fd, NIOCTXSYNC, NULL);
+			//ioctl(vnet->tx_fd, NIOCTXSYNC, NULL);
 		}
 	}
 
@@ -667,7 +719,7 @@ vxlan_netmap_internal_to_overlay (void * param)
 
 void
 process_vxlan_to_ether (struct vxlan_pkt * vpkt, size_t len,
-			struct netmap_ring * txring, int tx_fd)
+			struct netmap_ring * txring)
 {
 	__u32 vni;
 	u_int cur;
@@ -696,14 +748,6 @@ process_vxlan_to_ether (struct vxlan_pkt * vpkt, size_t len,
 		add_fdb (v, f);
 	}
 
-	/* xmit decaped packet */
-	if (txring->avail == 0) {
-		while (!NETMAP_TX_RING_EMPTY (txring)) {
-			ioctl (tx_fd, NIOCTXSYNC, NULL);
-			usleep (1);
-		}
-	}
-
 	cur = txring->cur;
 	slot = &txring->slot[cur];
 	pkt = NETMAP_BUF (txring, slot->buf_idx);
@@ -724,6 +768,7 @@ vxlan_netmap_overlay_to_internal (void * param)
 	/* receive vxlan packet from overlay, decap it, and 
 	   send to internal network with tagged vlan. */
 
+	int fd;
 	u_int cur;
 	struct vxlan_pkt * vpkt;
 	struct vxlan_netmap_instance * vnet;
@@ -733,18 +778,24 @@ vxlan_netmap_overlay_to_internal (void * param)
 	struct pollfd x[1];
 
 	vnet = (struct vxlan_netmap_instance *) param;
-	rxring = vnet->rxring;
-	txring = vnet->txring;
+	D ("rx %s q %d, tx %s q %d", vnet->rx_ifname, vnet->rx_qnum, 
+	   vnet->tx_ifname, vnet->tx_qnum);
+
+	fd = extract_netmap_rx_ring (vnet->rx_ifname, vnet->rx_qnum, &rxring);
+	extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
 
 	pthread_detach (pthread_self ());
-	
-	x[0].fd = vnet->rx_fd;
+
+	x[0].fd = fd;
 	x[0].events = POLLIN;
 
-	D ("rx ring is %p tx is %p", rxring, txring);
-
 	for (;;) {
-		poll (x, 1, 100);
+#ifdef BUSYWAIT
+		ioctl(fd, NIOCRXSYNC, NULL);
+#else
+		if (poll (x, 1, POLL_TIMEOUT) == 0)
+			continue;
+#endif
 
 		for (; rxring->avail > 0; rxring->avail--) {
 			
@@ -753,11 +804,8 @@ vxlan_netmap_overlay_to_internal (void * param)
 			vpkt = (struct vxlan_pkt *) 
 				NETMAP_BUF (rxring, slot->buf_idx);
 
-			process_vxlan_to_ether (vpkt, slot->len, txring, 
-						vnet->tx_fd);
-			cur = NETMAP_RING_NEXT (rxring, cur);
-			rxring->cur = cur;
-			ioctl(vnet->tx_fd, NIOCTXSYNC, NULL);
+			process_vxlan_to_ether (vpkt, slot->len, txring);
+			rxring->cur = NETMAP_RING_NEXT (rxring, cur);
 		}
 	}
 
@@ -787,7 +835,7 @@ vni_vlan_map_init (char * vnivlan)
 	/* vnivlan is "vni-vlan-mcastaddr" */
 
 	int n, vlan, vni;
-	char * args[3];
+	char * args[4] = { NULL, NULL, NULL, NULL };
 	struct in_addr mcast_addr;
 	struct vni * v;
 
@@ -797,7 +845,7 @@ vni_vlan_map_init (char * vnivlan)
 		}
 	}
 
-	strsplit (vnivlan, args, 3);
+	strsplit (vnivlan, args, 4);
 
 	vni = atoi (args[0]);
 	vlan = atoi (args[1]);
@@ -845,11 +893,9 @@ usage (void)
 int
 main (int argc, char ** argv)
 {
-	int ov_fd, in_fd, n, ch;
-	char * ovmem, * inmem;
-	struct nmreq ovreq, inreq;
+	int fd, ov_qnum, in_qnum, n, ch;
+	struct nmreq nmr;
 	struct vxlan_netmap_instance * vnet;
-	struct netmap_if * ov_nifp, * in_nifp;
 
 	memset (&vxlan, 0, sizeof (vxlan));
 
@@ -889,93 +935,63 @@ main (int argc, char ** argv)
 	}
 
 	
-	/* register overlay interface to netmap */
-	ov_fd = open ("/dev/netmap", O_RDWR);
-	if (ov_fd < 0) {
-		D ("unable to open /dev/netmap");
+	/* check number of rings */
+	
+	fd = open ("/dev/netmap", O_RDWR);
+	if (fd < 0) {
+		D ("Unable to open /dev/netmap");
+		perror ("open");
 		return -1;
 	}
 
-	memset (&ovreq, 0, sizeof (ovreq));
-	ovreq.nr_version = NETMAP_API;
-	strcpy (ovreq.nr_name, vxlan.overlay_ifname);
-
-	if (ioctl (ov_fd, NIOCREGIF, &ovreq) < 0) {
-		D ("unable to register overlay interface");
+	memset (&nmr, 0, sizeof (nmr));
+	nmr.nr_version = NETMAP_API;
+	strncpy (nmr.nr_name, vxlan.overlay_ifname, IFNAMSIZ - 1);
+	if (ioctl (fd, NIOCGINFO, &nmr) < 0) {
+		D ("unabe to get interface info for %s", 
+		   vxlan.overlay_ifname);
 		return -1;
 	}
+	ov_qnum = nmr.nr_rx_rings;
 
-	ovmem = mmap (NULL, ovreq.nr_memsize,
-		      PROT_READ|PROT_WRITE, MAP_SHARED, ov_fd, 0);
-	if (ovmem == MAP_FAILED) {
-		D ("unable to mmap");
+	memset (&nmr, 0, sizeof (nmr));
+	nmr.nr_version = NETMAP_API;
+	strncpy (nmr.nr_name, vxlan.internal_ifname, IFNAMSIZ - 1);
+	if (ioctl (fd, NIOCGINFO, &nmr) < 0) {
+		D ("unabe to get interface info for %s", 
+		   vxlan.overlay_ifname);
 		return -1;
 	}
-
-	ov_nifp = NETMAP_IF (ovmem, ovreq.nr_offset);
-
-
-	/* regsiter internal interface to netmap */
-
-	in_fd = open ("/dev/netmap", O_RDWR);
-	if (in_fd < 0) {
-		D ("unable to open /dev/netmap");
-		return -1;
-	}
-
-	memset (&inreq, 0, sizeof (inreq));
-	inreq.nr_version = NETMAP_API;
-	strcpy (inreq.nr_name, vxlan.internal_ifname);
-
-	if (ioctl (in_fd, NIOCREGIF, &inreq) < 0) {
-		D ("unable to register internal interface");
-		return -1;
-	}
-
-	inmem = mmap (NULL, inreq.nr_memsize,
-		      PROT_READ|PROT_WRITE, MAP_SHARED, in_fd, 0);
-	if (inmem == MAP_FAILED) {
-		D ("unable to mmap");
-		return -1;
-	}
-
-	in_nifp = NETMAP_IF (inmem, inreq.nr_offset);
+	in_qnum = nmr.nr_rx_rings;
 
 	
+	/* asign threads for rings */
 
-	/* asign threads for threads */
-
-	if (set_if_promisc (vxlan.overlay_ifname) < 0) 
-		return -1;
-
-	if (set_if_promisc (vxlan.internal_ifname) < 0)
-		return -1;
-
-	/* overlay -> internal */
-	for (n = 0; n < ovreq.nr_rx_rings; n++) {
-		vnet = (struct vxlan_netmap_instance *) malloc 
+	/* overlay to internal */
+	for (n = 0; n < ov_qnum; n++) {
+		vnet = (struct vxlan_netmap_instance *) malloc
 			(sizeof (struct vxlan_netmap_instance));
 		memset (vnet, 0, sizeof (struct vxlan_netmap_instance));
 
-		vnet->rx_fd = ov_fd;
-		vnet->tx_fd = in_fd;
-		vnet->rxring = NETMAP_RXRING (ov_nifp, n);
-		vnet->txring = NETMAP_TXRING (in_nifp, n % inreq.nr_tx_rings);
+		vnet->rx_ifname = vxlan.overlay_ifname;
+		vnet->tx_ifname = vxlan.internal_ifname;
+		vnet->rx_qnum = n % in_qnum;
+		vnet->tx_qnum = n;
 
 		pthread_create (&vxlan.overlay_t[n], NULL, 
 				vxlan_netmap_overlay_to_internal, vnet);
 	}
 
-	/* internal -> overlay */
-	for (n = 0; n < inreq.nr_rx_rings; n++) {
-		vnet = (struct vxlan_netmap_instance *) malloc 
+	/* internal to overlay*/
+	for (n = 0; n < ov_qnum; n++) {
+		vnet = (struct vxlan_netmap_instance *) malloc
 			(sizeof (struct vxlan_netmap_instance));
 		memset (vnet, 0, sizeof (struct vxlan_netmap_instance));
 
-		vnet->rx_fd = in_fd;
-		vnet->tx_fd = ov_fd;
-		vnet->rxring = NETMAP_RXRING (in_nifp, n);
-		vnet->txring = NETMAP_TXRING (ov_nifp, n % ovreq.nr_tx_rings);
+		vnet->rx_ifname = vxlan.internal_ifname;
+		vnet->tx_ifname = vxlan.overlay_ifname;
+		vnet->rx_qnum = n;
+		vnet->tx_qnum = n % ov_qnum;
 
 		pthread_create (&vxlan.internal_t[n], NULL, 
 				vxlan_netmap_internal_to_overlay, vnet);
@@ -983,6 +999,7 @@ main (int argc, char ** argv)
 
 
 	while (1) {
+		/* controling vxlan module will be implemented here */
 		sleep (1);
 	}
 
