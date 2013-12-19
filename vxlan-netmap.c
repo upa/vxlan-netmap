@@ -670,13 +670,11 @@ vxlan_netmap_internal_to_overlay (void * param)
 	   vxlan encap to vxlan overlay networks. */
 
 	u_int cur;
-	int fd;
+	int fd, tfd;
 	struct ether_header * eth;
 	struct vxlan_netmap_instance * vnet;
 	struct netmap_ring * rxring, * txring;
 	struct netmap_slot * slot;
-
-	struct pollfd x[1];
 
 	vnet = (struct vxlan_netmap_instance *) param;
 	D ("rx %s q %d, tx %s q %d", vnet->rx_ifname, vnet->rx_qnum, 
@@ -685,12 +683,15 @@ vxlan_netmap_internal_to_overlay (void * param)
 	rxring = txring = NULL;
 
 	fd = extract_netmap_rx_ring (vnet->rx_ifname, vnet->rx_qnum, &rxring);
-	extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
+	tfd = extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
 
 	pthread_detach (pthread_self ());
 
+#ifndef BUSYWAIT
+	struct pollfd x[1];
 	x[0].fd = fd;
 	x[0].events = POLLIN;
+#endif
 
 	for (;;) {
 #ifdef BUSYWAIT
@@ -709,7 +710,10 @@ vxlan_netmap_internal_to_overlay (void * param)
 
 			process_ether_to_vxlan (eth, slot->len, txring);
 			rxring->cur = NETMAP_RING_NEXT (rxring, cur);
-			//ioctl(vnet->tx_fd, NIOCTXSYNC, NULL);
+
+#ifdef BUSYWAIT
+		ioctl(tfd, NIOCTXSYNC, NULL);		
+#endif
 		}
 	}
 
@@ -768,26 +772,27 @@ vxlan_netmap_overlay_to_internal (void * param)
 	/* receive vxlan packet from overlay, decap it, and 
 	   send to internal network with tagged vlan. */
 
-	int fd;
+	int fd, tfd;
 	u_int cur;
 	struct vxlan_pkt * vpkt;
 	struct vxlan_netmap_instance * vnet;
 	struct netmap_ring * rxring, * txring;
 	struct netmap_slot * slot;
 
-	struct pollfd x[1];
-
 	vnet = (struct vxlan_netmap_instance *) param;
 	D ("rx %s q %d, tx %s q %d", vnet->rx_ifname, vnet->rx_qnum, 
 	   vnet->tx_ifname, vnet->tx_qnum);
 
 	fd = extract_netmap_rx_ring (vnet->rx_ifname, vnet->rx_qnum, &rxring);
-	extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
+	tfd = extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
 
 	pthread_detach (pthread_self ());
 
+#ifndef BUSYWAIT
+	struct pollfd x[1];
 	x[0].fd = fd;
 	x[0].events = POLLIN;
+#endif
 
 	for (;;) {
 #ifdef BUSYWAIT
@@ -807,6 +812,10 @@ vxlan_netmap_overlay_to_internal (void * param)
 			process_vxlan_to_ether (vpkt, slot->len, txring);
 			rxring->cur = NETMAP_RING_NEXT (rxring, cur);
 		}
+
+#ifdef BUSYWAIT
+		ioctl(tfd, NIOCTXSYNC, NULL);		
+#endif
 	}
 
 	return NULL;
