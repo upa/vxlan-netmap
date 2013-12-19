@@ -984,8 +984,8 @@ main (int argc, char ** argv)
 
 		vnet->rx_ifname = vxlan.overlay_ifname;
 		vnet->tx_ifname = vxlan.internal_ifname;
-		vnet->rx_qnum = n % in_qnum;
-		vnet->tx_qnum = n;
+		vnet->rx_qnum = n;
+		vnet->tx_qnum = n % in_qnum;
 
 		pthread_create (&vxlan.overlay_t[n], NULL, 
 				vxlan_netmap_overlay_to_internal, vnet);
