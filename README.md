@@ -17,10 +17,10 @@ vxlan-netmap
 	 sudo ./vxlan-netmap -o ixgbe0 -i ixgbe1 -s 10.0.1.2 -v 1-10-239.0.0.10 -v 2-20-239.0.0.20
 
 
-Packets including vlan id from internal interface are encapsulated
-with a VNI which is configured by -v option, and xmited to vxlan
-overlay interface.  Type of ethernet frames in vxlan overlay network
-is ETHERTYPE_VLAN.
+Packets including vlan id from a internal interface are encapsulated
+with a VNI which is configured by -v option, and transmited to vxlan
+overlay network from a ovler interface. Type of ethernet frames in
+vxlan overlay network is always ETHERTYPE_VLAN.
 
 
 Todo
