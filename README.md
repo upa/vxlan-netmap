@@ -1,6 +1,10 @@
 vxlan-netmap
 ============
 
+netmap is a framework for high speed packet I/O.
+about netmap, please see http://info.iet.unipi.it/~luigi/netmap/ .
+this implementation is vxlan gateway using netmap I/O. perhaps, it's so fast.
+
 	 ./vxlan-netmap 
 	 usage of vxlan-netmap
 	 	 -o : overlay interface name
@@ -19,7 +23,7 @@ vxlan-netmap
 
 Packets including vlan id from a internal interface are encapsulated
 with a VNI which is configured by -v options, and transmited to vxlan
-overlay network from a overlay interface. Type of ethernet frames in
+overlay network from an overlay interface. Type of ethernet frames on
 vxlan overlay network is always ETHERTYPE_VLAN.
 
 
