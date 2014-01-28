@@ -29,6 +29,8 @@
 
 #include "list.h"
 
+#define POLL_TIMEOUT 0
+
 /* from nm_util.h */
 #define D(format, ...)					\
         fprintf(stderr, "%s [%d] " format "\n",         \
@@ -39,8 +41,6 @@
 
 #define VLAN_VALIDATE(v) (0 < v && v < 4096)
 #define VNI_VALIDATE(v) (0 < v && v < 0xFFFFFF)
-
-#define POLL_TIMEOUT 1
 
 struct ether_vlan {
 	__u8	ether_dhost[ETH_ALEN];
@@ -298,7 +298,8 @@ wrapsum(u_int32_t sum)
 /* netmap util*/
 
 int
-extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring, int x)
+extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring,
+		     int x, int w)
 {
 	int fd;
 	char * mem;
@@ -316,7 +317,7 @@ extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring, int x)
 	memset (&nmr, 0, sizeof (nmr));
 	strcpy (nmr.nr_name, ifname);
 	nmr.nr_version = NETMAP_API;
-	nmr.nr_ringid = (q | NETMAP_HW_RING);
+	nmr.nr_ringid = (q | w);
 
 	if (ioctl (fd, NIOCREGIF, &nmr) < 0) {
 		D ("unable to register interface %s", ifname);
@@ -324,7 +325,7 @@ extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring, int x)
 	}
 
 	mem = mmap (NULL, nmr.nr_memsize,
-		      PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+		    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	if (mem == MAP_FAILED) {
 		D ("unable to mmap");
 		return -1;
@@ -339,8 +340,15 @@ extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring, int x)
 
 	return fd;
 }
-#define extract_netmap_tx_ring(i, q, r) extract_netmap_ring (i, q, r, 1)
-#define extract_netmap_rx_ring(i, q, r) extract_netmap_ring (i, q, r, 0)
+#define extract_netmap_hw_tx_ring(i, q, r) \
+	extract_netmap_ring (i, q, r, 1, NETMAP_HW_RING)
+#define extract_netmap_hw_rx_ring(i, q, r) \
+	extract_netmap_ring (i, q, r, 0, NETMAP_HW_RING)
+#define extract_netmap_sw_tx_ring(i, q, r) \
+	extract_netmap_ring (i, q, r, 1, NETMAP_SW_RING)
+#define extract_netmap_sw_rx_ring(i, q, r) \
+	extract_netmap_ring (i, q, r, 0, NETMAP_SW_RING)
+
 
 
 /****  FDB  *****/
@@ -358,8 +366,8 @@ dump_fdb (struct vni * v)
 	struct fdb * f;
 
 	list_for_each_entry (f, &v->fdb_chain, chain) {
-		D ("dump vni %u, %p, %02x:%02x:%02x:%02x:%02x:%02x", v->vni,
-		   f,
+		D ("dump vni %u, %p, %02x:%02x:%02x:%02x:%02x:%02x", 
+		   v->vni, f,
 		   f->mac[0], f->mac[1],
 		   f->mac[2], f->mac[3],
 		   f->mac[4], f->mac[5]);
@@ -669,8 +677,8 @@ vxlan_netmap_internal_to_overlay (void * param)
 	/* receive ethernet frame from internal, and send it with 
 	   vxlan encap to vxlan overlay networks. */
 
+	int fd;
 	u_int cur;
-	int fd, tfd;
 	struct ether_header * eth;
 	struct vxlan_netmap_instance * vnet;
 	struct netmap_ring * rxring, * txring;
@@ -682,16 +690,23 @@ vxlan_netmap_internal_to_overlay (void * param)
 
 	rxring = txring = NULL;
 
-	fd = extract_netmap_rx_ring (vnet->rx_ifname, vnet->rx_qnum, &rxring);
-	tfd = extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
+	fd = extract_netmap_hw_rx_ring (vnet->rx_ifname, vnet->rx_qnum,
+					&rxring);
 
-	pthread_detach (pthread_self ());
 
-#ifndef BUSYWAIT
+#ifdef BUSYWAIT
+	int tfd;
+	tfd = extract_netmap_hw_tx_ring (vnet->tx_ifname, vnet->tx_qnum, 
+					 &txring);
+#else
 	struct pollfd x[1];
 	x[0].fd = fd;
 	x[0].events = POLLIN;
+
+	extract_netmap_hw_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
 #endif
+
+	pthread_detach (pthread_self ());
 
 	for (;;) {
 #ifdef BUSYWAIT
@@ -772,7 +787,7 @@ vxlan_netmap_overlay_to_internal (void * param)
 	/* receive vxlan packet from overlay, decap it, and 
 	   send to internal network with tagged vlan. */
 
-	int fd, tfd;
+	int fd;
 	u_int cur;
 	struct vxlan_pkt * vpkt;
 	struct vxlan_netmap_instance * vnet;
@@ -783,16 +798,21 @@ vxlan_netmap_overlay_to_internal (void * param)
 	D ("rx %s q %d, tx %s q %d", vnet->rx_ifname, vnet->rx_qnum, 
 	   vnet->tx_ifname, vnet->tx_qnum);
 
-	fd = extract_netmap_rx_ring (vnet->rx_ifname, vnet->rx_qnum, &rxring);
-	tfd = extract_netmap_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
+	fd = extract_netmap_hw_rx_ring (vnet->rx_ifname, vnet->rx_qnum,
+					&rxring);
 
-	pthread_detach (pthread_self ());
-
-#ifndef BUSYWAIT
+#ifdef BUSYWAIT
+	int tfd
+	tfd = extract_netmap_hw_tx_ring (vnet->tx_ifname, vnet->tx_qnum,
+					 &txring);
+#else
 	struct pollfd x[1];
 	x[0].fd = fd;
 	x[0].events = POLLIN;
+	extract_netmap_hw_tx_ring (vnet->tx_ifname, vnet->tx_qnum, &txring);
 #endif
+
+	pthread_detach (pthread_self ());
 
 	for (;;) {
 #ifdef BUSYWAIT
@@ -872,7 +892,6 @@ vni_vlan_map_init (char * vnivlan)
 		D ("invalid vlan id %s", args[1]);
 		return -1;
 	}
-	
 
 	v = create_vni (vni, vlan, mcast_addr);
 	
@@ -935,7 +954,9 @@ main (int argc, char ** argv)
 			}
 			break;
 		case 'v' :
-			vni_vlan_map_init (optarg);
+			if (vni_vlan_map_init (optarg) < 0) 
+				return -1;
+				
 			break;
 		default :
 			usage ();
@@ -943,7 +964,6 @@ main (int argc, char ** argv)
 		}
 	}
 
-	
 	/* check number of rings */
 	
 	fd = open ("/dev/netmap", O_RDWR);
@@ -1006,6 +1026,8 @@ main (int argc, char ** argv)
 				vxlan_netmap_internal_to_overlay, vnet);
 	}
 
+	set_if_promisc (vxlan.overlay_ifname);
+	set_if_promisc (vxlan.internal_ifname);
 
 	while (1) {
 		/* controling vxlan module will be implemented here */
