@@ -3,7 +3,7 @@ vxlan-netmap
 
 netmap is a framework for high speed packet I/O.
 about netmap, please see http://info.iet.unipi.it/~luigi/netmap/ .
-this implementation is vxlan gateway using netmap I/O. perhaps, it's so fast.
+this implementation is vxlan gateway using netmap I/O.
 
 	 ./vxlan-netmap 
 	 usage of vxlan-netmap
@@ -17,14 +17,15 @@ this implementation is vxlan gateway using netmap I/O. perhaps, it's so fast.
 	 ethtool -K ixgbe0 rxvlan off txvlan off
 	 ethtool -K ixgbe1 rxvlan off txvlan off
 	 
-	 gcc -g vxlan-netmap.c -I../sys -o vxlan-netmap -lpthread
+	 gcc -g vxlan-netmap.c -o vxlan-netmap -lpthread
 	 sudo ./vxlan-netmap -o ixgbe0 -i ixgbe1 -s 10.0.1.2 -v 1-10-239.0.0.10 -v 2-20-239.0.0.20
 
 
 Packets including vlan id from a internal interface are encapsulated
 with a VNI which is configured by -v options, and transmited to vxlan
-overlay network from an overlay interface. Type of ethernet frames on
-vxlan overlay network is always ETHERTYPE_VLAN.
+overlay network from an overlay interface. specifying vlan id 0 means
+untaged packet.
+
 
 
 Todo
