@@ -25,6 +25,7 @@
 #include <netinet/udp.h>
 
 #include <net/netmap.h>
+#define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
 
 #include "list.h"
@@ -32,16 +33,11 @@
 #define POLL_TIMEOUT 0
 #define NM_BURST_MAX 1024
 
-/* from nm_util.h */
-#define D(format, ...)					\
-        fprintf(stderr, "%s [%d] " format "\n",         \
-		__FUNCTION__, __LINE__, ##__VA_ARGS__)
-
 
 #define GOLDEN_RATIO_PRIME_32 0x9e370001UL
 
-#define VLAN_VALIDATE(v) (0 < v && v < 4096)
-#define VNI_VALIDATE(v) (0 < v && v < 0xFFFFFF)
+#define VLAN_VALIDATE(v) (0 <= v && v < 4096)
+#define VNI_VALIDATE(v) (0 <= v && v < 0xFFFFFF)
 
 struct ether_vlan {
 	__u8	ether_dhost[ETH_ALEN];
@@ -58,7 +54,7 @@ struct vxlanhdr {
 	__u32	vx_vni;
 } __attribute__ ((__packed__));
 #define VXLAN_FLAGS	0x08000000
-#define VXLAN_PORT	8472
+#define VXLAN_PORT	4789
 #define VXLAN_HEADROOM (sizeof (struct ether_header) + sizeof (struct ip) \
 			+ sizeof (struct udphdr) + sizeof (struct vxlanhdr))
 
@@ -120,6 +116,7 @@ struct vni {
 
 struct vxlan {
 	int fd;
+	int vxlan_port;
 	char * overlay_ifname, * internal_ifname;
 	
 	struct list_head	vni_list[VNI_HASH_SIZE];
@@ -133,8 +130,6 @@ struct vxlan {
 	struct in_addr src_addr;
 	struct in_addr gateway_addr;
 	__u8	src_mac[ETH_ALEN];
-
-	struct netmap_ring * txrings[VXLAN_THREAD_MAX];
 };
 
 struct vxlan vxlan;
@@ -247,7 +242,20 @@ eth_hash(const __u8 * addr)
 
 	__u64 value = 0;
 
-	memcpy (&value, addr, ETH_ALEN);
+	value &= addr[0];
+	value <<= 8;
+	value &= addr[1];
+	value <<= 8;
+	value &= addr[2];
+	value <<= 8;
+	value &= addr[3];
+	value <<= 8;
+	value &= addr[4];
+	value <<= 8;
+	value &= addr[5];
+	value <<= 8;
+	value &= addr[6];
+	value <<= 8;
 
 	/* only want 6 bytes */
 #ifdef __BIG_ENDIAN
@@ -317,7 +325,8 @@ extract_netmap_ring (char * ifname, int q, struct netmap_ring ** ring, int x)
 	memset (&nmr, 0, sizeof (nmr));
 	strcpy (nmr.nr_name, ifname);
 	nmr.nr_version = NETMAP_API;
-	nmr.nr_ringid = q;
+	nmr.nr_flags = NETMAP_NO_TX_POLL | NETMAP_DO_RX_POLL;
+	nmr.nr_ringid = NETMAP_HW_RING | q;
 
 	if (ioctl (fd, NIOCREGIF, &nmr) < 0) {
 		D ("unable to register interface %s", ifname);
@@ -389,13 +398,19 @@ dump_fdb2 (struct vni * v)
 	return;
 }
 
+
+#define _MACCMP(s, d, n) (s[n] != d[n]) ? 0 :
+#define MACCMP(s, d) \
+	(_MACCMP(s, d, 0) _MACCMP(s, d, 1) _MACCMP(s, d, 2)	\
+	 _MACCMP(s, d, 3) _MACCMP(s, d, 4) _MACCMP(s, d, 5) 1)
+
 struct fdb *
 find_fdb (struct list_head * fdb_list, const __u8 * mac)
 {
 	struct fdb * f;
 
 	list_for_each_entry (f, fdb_head (fdb_list, mac), list) {
-		if (memcmp (f->mac, mac, ETH_ALEN) == 0)
+		if (MACCMP (f->mac, mac))
 			return f;
 	}
 
@@ -458,7 +473,7 @@ find_vni (struct list_head * vni_list, __u32 vni)
 	struct vni * v;
 
 	list_for_each_entry (v, vni_head (vni_list, vni), list) {
-		if (memcmp (&v->vni, &vni, sizeof (vni)) == 0)
+		if (v->vni == vni)
 			return v;
 	}
 
@@ -535,11 +550,15 @@ create_vni (__u32 vni, __u16 vlan, struct in_addr mcast_addr)
 
 /****  setup headers ****/
 
+#define mac_copy(s, d) \
+	d[0] = s[0]; d[1] = s[1]; d[2] = s[2];	\
+	d[3] = s[3]; d[4] = s[4]; d[5] = s[5];	\
+
 void
 set_ether_header (struct vxlan_pkt * vpkt, __u8 * dst_mac, __u8 * src_mac)
 {
-	memcpy (vpkt->eth.ether_dhost, dst_mac, ETH_ALEN);
-	memcpy (vpkt->eth.ether_shost, src_mac, ETH_ALEN);
+	mac_copy (dst_mac, vpkt->eth.ether_dhost);
+	mac_copy (src_mac, vpkt->eth.ether_shost);
 	vpkt->eth.ether_type = htons (ETHERTYPE_IP);
 
 	return;
@@ -565,7 +584,8 @@ set_ip_header (struct vxlan_pkt * vpkt, struct in_addr * dst_addr,
         ip->ip_dst = *dst_addr;
         ip->ip_src = *src_addr;
 	ip->ip_sum = 0;
-        ip->ip_sum = wrapsum (checksum (ip, sizeof (*ip), 0));
+	if (0)
+		ip->ip_sum = wrapsum (checksum (ip, sizeof (*ip), 0));
 
 	return;
 }
@@ -577,8 +597,8 @@ set_udp_header (struct vxlan_pkt * vpkt, size_t len)
 
         udp = &vpkt->udp;
 
-        udp->uh_sport = htons (VXLAN_PORT);
-        udp->uh_dport = htons (VXLAN_PORT);
+        udp->uh_sport = htons (vxlan.vxlan_port);
+        udp->uh_dport = htons (vxlan.vxlan_port);
 
         udp->uh_ulen = htons (len);
 
@@ -617,22 +637,20 @@ process_ether_to_vxlan (char * src, size_t len, char * pkt)
 
 	eth = (struct ether_header *) src;
 
-	if (ntohs (eth->ether_type) != ETHERTYPE_VLAN) {
-		D ("packet is not tagged vlan frame, type 0x%x",
-		   ntohs (eth->ether_type));
-		return;
+	if (ntohs (eth->ether_type) == ETHERTYPE_VLAN) {
+		veth = (struct ether_vlan *) eth;
+		vlan = ((ntohs (veth->vlan_tci) << 4) >> 4);
+	} else {
+		vlan = 0;
 	}
 
-	veth = (struct ether_vlan *) eth;
-	vlan = ((ntohs (veth->vlan_tci) << 4) >> 4);
-	
 	v = vxlan.vlan_table [vlan];
 	if (!v) {
 		D ("vni instance does not exist in vlan table");
 		return;
 	}
 	
-	f = find_fdb (v->fdb_list, veth->ether_dhost);
+	f = find_fdb (v->fdb_list, eth->ether_dhost);
 	if (f) {
 		dst_mac = f->vtep_mac;
 		dst_addr = (struct in_addr *)&f->vtep;
@@ -653,7 +671,7 @@ process_ether_to_vxlan (char * src, size_t len, char * pkt)
 			sizeof (struct vxlanhdr));
 	set_vxlan_header (vpkt, v->vni);
 
-	memcpy (vpkt->body, (char *)eth, len);
+	nm_pkt_copy ((char *)eth, vpkt->body, len);
 
 	return;
 }
@@ -708,7 +726,6 @@ vxlan_netmap_internal_to_overlay (void * param)
 
 			epkt = NETMAP_BUF (rxring, rs->buf_idx);
 			vpkt = NETMAP_BUF (txring, ts->buf_idx);
-
 			process_ether_to_vxlan (epkt, rs->len, vpkt);
 			ts->len = rs->len + VXLAN_HEADROOM;
 
@@ -737,7 +754,6 @@ process_vxlan_to_ether (char * src, size_t len, char * pkt)
 
 	vpkt = (struct vxlan_pkt *) src;
 	
-
 	vni = ntohl (vpkt->vxlan.vx_vni) >> 8;
 	v = find_vni (vxlan.vni_list, vni);
 	if (!v) {
@@ -775,7 +791,6 @@ vxlan_netmap_overlay_to_internal (void * param)
 	struct netmap_ring * rxring, * txring;
 	struct netmap_slot * rs, * ts;
 	struct pollfd x[1];
-
 
 	rxring = txring = NULL;
 
@@ -899,6 +914,7 @@ usage (void)
 		"\t -i : internal interface name\n"
 		"\t -s : source vtep address\n"
 		"\t -v : vni-vlan-mcastaddr mapping\n"
+		"\t -p : vxlan port. defualt 4789\n"
 		"\n"
 		);
 
@@ -922,6 +938,7 @@ main (int argc, char ** argv)
 	for (n = 0; n < VLAN_TABLE_SIZE; n++)
 		vxlan.vlan_table[n] = NULL;
 		
+	vxlan.vxlan_port = VXLAN_PORT;
 
 	while ((ch = getopt (argc, argv, "o:i:s:v:")) != -1) {
 
@@ -944,6 +961,9 @@ main (int argc, char ** argv)
 			if (vni_vlan_map_init (optarg) < 0)
 				return -1;
 				
+			break;
+		case 'p' :
+			vxlan.vxlan_port = atoi (optarg);
 			break;
 		default :
 			usage ();
@@ -979,7 +999,7 @@ main (int argc, char ** argv)
 		return -1;
 	}
 	in_qnum = nmr.nr_rx_rings;
-
+	close (fd);
 	
 	/* asign threads for rings */
 
